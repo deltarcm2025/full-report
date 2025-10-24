@@ -28,6 +28,11 @@
     .controls { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; align-items:center; }
     .provider-list { display:flex; flex-wrap:wrap; gap:8px; max-height:120px; overflow:auto; padding:6px; border:1px dashed var(--line); border-radius:8px; background:#fff; }
     .provider-list label { display:flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid var(--line); border-radius:999px; background:#f8fafc; font-size:12px; }
+    .kpis { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:12px; margin-top:8px; }
+    .kpi { background: white; border:1px solid var(--line); border-radius:12px; padding:14px; }
+    .kpi h4 { margin:0; font-size:13px; color:#6b7280; font-weight:600; }
+    .kpi .val { font-size:28px; font-weight:800; margin-top:6px; color:#111827; }
+    .pill-legend { display:flex; gap:10px; align-items:center; }
     @media print { button, textarea, input, select, .note { display:none; } .card { box-shadow:none; border:1px solid var(--line); break-inside: avoid; } }
   </style>
 </head>
@@ -47,446 +52,383 @@
   <div id="output"></div>
 
   <script>
-    let allClaims = [];
-    let selectedProviders = new Set();
-    let detailRenderFuncs = [];
-    let claimsAQL = [];
-    let claimsNUM = [];
-
     // ---------------- File load ----------------
-    function readFiles(input) {
-      let files = Array.from(input.files);
-      let existing = document.getElementById('data').value.trim();
-      let combined = existing? [existing] : [];
-      let pending = files.length;
-      if (!pending && !existing) { analyze(); return; }
-      if (!pending) { analyze(); return; }
-
-      files.forEach(file => {
-        let reader = new FileReader();
-        reader.onload = function(e) {
-          combined.push(e.target.result.trim());
-          pending--;
-          if (pending === 0) {
-            document.getElementById('data').value = combined.join('\n');
-            analyze();
-          }
-        };
-        reader.readAsText(file);
-      });
-      input.value = ''; // Clear file input
+    async function readFiles(input){
+      const files = Array.from(input.files || []);
+      if (!files.length) return;
+      if (files.length > 5){ alert('Please select at most 5 files. Using the first 5.'); files.length = 5; }
+      const texts = await Promise.all(files.map(f=>f.text()));
+      // Merge with single header
+      let header = '';
+      const bodyLines = [];
+      for (let t of texts){
+        const norm = t.replace(/\r\n?|\n/g, '\n');
+        const lines = norm.split('\n').filter(l=>l.trim().length>0);
+        if (!lines.length) continue;
+        if (!header){ header = lines[0]; bodyLines.push(...lines.slice(1)); }
+        else {
+          const maybeHeader = lines[0].trim();
+          const startIdx = (maybeHeader.toLowerCase() === header.trim().toLowerCase()) ? 1 : 0;
+          bodyLines.push(...lines.slice(startIdx));
+        }
+      }
+      if (!header){ alert('No readable rows found in the selected files.'); return; }
+      document.getElementById('data').value = [header, ...bodyLines].join('\n');
     }
-    
+
+    // ---------------- Parsing ----------------
+    function detectDelimiter(text){
+      const first = (text.split(/\r?\n/).find(l => l.trim().length) || '');
+      return first.includes('\t') ? '\t' : ',';
+    }
+
+    function parseDelimited(text, delim){
+      const rows = [];
+      let field = '', row = [], inQuotes = false;
+      for (let i = 0; i < text.length; i++){
+        const c = text[i];
+        if (inQuotes){
+          if (c === '"'){
+            const next = text[i+1];
+            if (next === '"'){ field += '"'; i++; }
+            else { inQuotes = false; }
+          } else { field += c; }
+        } else {
+          if (c === '"') inQuotes = true;
+          else if (c === delim) { row.push(field); field = ''; }
+          else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+          else if (c !== '\r') { field += c; }
+        }
+      }
+      if (field.length || row.length){ row.push(field); rows.push(row); }
+      return rows.map(r => r.map(x => (x ?? '').trim())).filter(r => r.some(x => x !== ''));
+    }
+
     // ---------------- Helpers ----------------
     function normalizeMoney(str){
-      if (typeof str !== 'string') return 0;
-      let s = str.trim().replace('$', '').replace(/,/g, '');
-      if (s.startsWith('(') && s.endsWith(')')) s = '-' + s.substring(1, s.length-1);
-      return parseFloat(s) || 0;
+      if (!str) return 0;
+      let s = String(str).replace(/[$,\s]/g, '').trim();
+      if (s.startsWith('(') && s.endsWith(')')) s = '-' + s.slice(1, -1);
+      const n = parseFloat(s);
+      return isNaN(n) ? 0 : n;
     }
 
-    function normalizeDate(str){
-      if (!str || typeof str !== 'string') return null;
-      let t = Date.parse(str.trim());
+    function idxOf(header, candidates){
+      const lower = header.map(h => (h||'').toLowerCase());
+      for (const cand of candidates){
+        const i = lower.indexOf(cand.toLowerCase());
+        if (i !== -1) return i;
+      }
+      return -1;
+    }
+
+    function parseDOS(str){
+      if(!str) return null;
+      const s = String(str).trim();
+      const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if(iso) return new Date(+iso[1], +iso[2]-1, +iso[3]);
+      const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+      if(mdy){ let y = +mdy[3]; if(y<100) y+=2000; return new Date(y, +mdy[1]-1, +mdy[2]); }
+      const t = Date.parse(s);
       return isNaN(t)? null : new Date(t);
     }
 
     function encBreakdown(rows){
-      const encSet = new Set(), paidSet = new Set();
-      rows.forEach(r => {
-        const key = r.patient_id || r.patient;
-        if (!key) return; // Skip if no identifier
-        encSet.add(key);
-        if (r.isPaid) paidSet.add(key);
-      });
+      const encSet = new Set(rows.map(x=> x.patient_id || x.patient))
+      const paidSet = new Set();
+      encSet.forEach(k=>{ const any = rows.some(v=> (v.patient_id||v.patient)===k && v.isPaid); if(any) paidSet.add(k); });
       const enc = encSet.size, paid = paidSet.size, unpaid = enc - paid;
       return { enc, paid, unpaid, pct: enc? Math.round(paid/enc*100) : 0 };
     }
 
-    function renderOverallSummaryStats() {
-        const statsDiv = document.getElementById('overallSummaryStats');
-        if (!statsDiv) return;
-
-        const filteredClaims = allClaims.filter(c => selectedProviders.size ? selectedProviders.has(c.provider) : true);
-        const totalCollected = filteredClaims.reduce((sum, claim) => sum + claim.paid, 0);
-        
-        // Encounters based on patient_id or patient name
-        const encounters = new Set();
-        filteredClaims.forEach(c => {
-            const key = c.patient_id || c.patient;
-            if (key) encounters.add(key); // Only count if identifier exists
-        });
-        const totalEncounters = encounters.size;
-
-        statsDiv.innerHTML = `
-            <div>
-                <div class="text-gray-600 text-sm font-medium">Total Collected</div>
-                <div class="text-3xl font-bold" style="color:var(--green);">$${totalCollected.toFixed(2)}</div>
-            </div>
-            <div>
-                <div class="text-gray-600 text-sm font-medium">Total Encounters</div>
-                <div class="text-3xl font-bold" style="color:var(--slate);">${totalEncounters}</div>
-            </div>
-        `;
-    }
-
-    function createClaimsDetailTable(title, claimsData, isPaidFilter) {
-        const detailsCard = document.createElement('div');
-        detailsCard.className = 'card';
-        
-        const filterIdSuffix = title.replace(/[^a-zA-Z0-9]/g, ''); // e.g., UnpaidClaims09
-
-        detailsCard.innerHTML = `<div class="section-title"><h3>${title}</h3>
-          <div class="controls">
-            <label>Provider: <select id="claimProvFilter${filterIdSuffix}"><option value="">All</option></select></label>
-            <label>CPT: <select id="claimCodeFilter${filterIdSuffix}"><option value="">All</option></select></label>
-            <label>DOS from: <input type="date" id="claimFrom${filterIdSuffix}"></label>
-            <label>to: <input type="date" id="claimTo${filterIdSuffix}"></label>
-          </div>
-        </div>`;
-
-        const tbl = document.createElement('table');
-        tbl.innerHTML = '<thead><tr><th style="width:6%">#</th><th style="width:16%">Provider</th><th style="width:20%">Payer</th><th style="width:10%">Patient ID</th><th style="width:10%">CPT</th><th style="width:8%">Units</th><th style="width:12%">DOS</th><th style="width:12%">Charge ($)</th><th style="width:12%">Paid ($)</th><th style="width:8%">Status</th></tr></thead>';
-        const tb = document.createElement('tbody');
-        tbl.appendChild(tb);
-        detailsCard.appendChild(tbl);
-
-        const claimProvFilter = detailsCard.querySelector(`#claimProvFilter${filterIdSuffix}`);
-        const claimCodeFilter = detailsCard.querySelector(`#claimCodeFilter${filterIdSuffix}`);
-        const claimFrom = detailsCard.querySelector(`#claimFrom${filterIdSuffix}`);
-        const claimTo = detailsCard.querySelector(`#claimTo${filterIdSuffix}`);
-
-        // Populate filters
-        const providerSet = Array.from(new Set(claimsData.map(c => c.provider))).sort();
-        claimProvFilter.innerHTML = '<option value="">All</option>' + providerSet.map(p => `<option value="${p}">${p}</option>`).join('');
-        
-        const codeSet = Array.from(new Set(claimsData.map(c => c.cpt))).sort();
-        claimCodeFilter.innerHTML = '<option value="">All</option>' + codeSet.map(c => `<option value="${c}">${c}</option>`).join('');
-
-        function renderClaims() {
-            tb.innerHTML = '';
-            const selProv = claimProvFilter.value;
-            const selCode = claimCodeFilter.value;
-            const fromVal = claimFrom.value ? new Date(claimFrom.value).getTime() : -Infinity;
-            const toVal = claimTo.value ? new Date(claimTo.value).getTime() : Infinity;
-
-            // Filter by selectedProviders first (using global var)
-            const base = claimsData.filter(c => selectedProviders.size ? selectedProviders.has(c.provider) : true);
-
-            base.forEach(r => {
-                // Apply table-specific filters
-                if (selProv && r.provider !== selProv) return;
-                if (selCode && r.cpt !== selCode) return;
-                
-                // This is the main filter for the table (unpaid/paid)
-                if (isPaidFilter === 'paid' && !r.isPaid) return;
-                if (isPaidFilter === 'unpaid' && r.isPaid) return;
-
-                const t = r.dateSort;
-                if (!(t >= fromVal && t <= toVal)) return;
-
-                const pill = r.isPaid ? '<span class="pill pill-paid">PAID</span>' : '<span class="pill pill-unpaid">UNPAID</span>';
-                tb.innerHTML += `<tr>
-                    <td>${r.claimNo}</td>
-                    <td>${r.provider}</td>
-                    <td>${r.payer || ''}</td>
-                    <td>${r.patient_id}</td>
-                    <td>${r.cpt}</td>
-                    <td>${Math.round(r.units)}</td>
-                    <td>${r.dos || ''}</td>
-                    <td>$${r.charge.toFixed(2)}</td>
-                    <td>$${r.paid.toFixed(2)}</td>
-                    <td>${pill}</td>
-                  </tr>`;
-            });
-        }
-
-        // Attach listeners
-        claimProvFilter.addEventListener('change', renderClaims);
-        claimCodeFilter.addEventListener('change', renderClaims);
-        claimFrom.addEventListener('change', renderClaims);
-        claimTo.addEventListener('change', renderClaims);
-
-        // Return an object with the card and the render function
-        return { card: detailsCard, render: renderClaims };
-    }
+    function fmtMoney(n){ return '$' + n.toFixed(2); }
 
     // ---------------- Main ----------------
     function analyze(){
-      // Reset global state
-      detailRenderFuncs = [];
-      allClaims = [];
-      claimsAQL = [];
-      claimsNUM = [];
-      selectedProviders.clear();
-
       const text = document.getElementById('data').value.trim();
       const output = document.getElementById('output');
       output.innerHTML = '';
-      if (!text) return;
+      if (!text){ alert('Please paste data or upload a file.'); return; }
 
-      const lines = text.split('\n');
-      const delim = lines[0].includes('\t') ? '\t' : ',';
-      const headers = lines[0].split(delim).map(h=>h.trim().toLowerCase().replace(/"/g,''));
-      
-      const iProv = headers.indexOf('provider');
-      const iCPT = headers.findIndex(h=> h.includes('cpt') || h.includes('procedure'));
-      const iDOS = headers.findIndex(h=> h.includes('dos') || (h.includes('service') && h.includes('date')));
-      const iUnits = headers.findIndex(h=> h.includes('unit'));
-      const iCharge = headers.findIndex(h=> h.includes('charge') || h.includes('billed'));
-      const iPaid = headers.findIndex(h=> h.includes('paid') || h.includes('payment'));
-      const iPayer = headers.findIndex(h=> h.includes('payer') || h.includes('insurance'));
-      const iPatient = headers.findIndex(h=> h.includes('patient') && !h.includes('id'));
-      const iPatientID = headers.findIndex(h=> h.includes('patient id') || h.includes('member id'));
-      
-      const defaultProvider = document.getElementById('providerName').value.trim() || 'Default Provider';
+      const delim = detectDelimiter(text);
+      const rows = parseDelimited(text, delim);
+      if (rows.length < 2){ output.innerHTML = '<p>No rows detected.</p>'; return; }
+
+      const header = rows[0];
+      const dataRows = rows.slice(1);
+      const iCPT = idxOf(header, ['cpt']);
+      const iUnits = idxOf(header, ['days_or_units','units','days']);
+      const iCharges = idxOf(header, ['charges','charge']);
+      const iPaid = idxOf(header, ['insurance_payment','paid','payment']);
+      const iPatient = idxOf(header, ['patient_name','patient']);
+      const iPatientID = idxOf(header, ['patient_id','id']);
+      const iDOS = idxOf(header, ['date_of_service','dos','date']);
+      const iPayer = idxOf(header, ['insurance provider','payer','insurance','plan','insurance_name','insurance provider name']);
+      const iProvider = idxOf(header, [
+        'provider','rendering provider','rendering_provider','attending','attending_provider',
+        'billing provider','billing_provider','ordering provider','ordering_provider','physician','provider_name','office provider'
+      ]);
 
       if (iCPT === -1){ output.innerHTML = '<p>Could not find a CPT column.</p>'; return; }
 
       // Extract claims into A/Q/L and Numeric (0–9)
+      const claimsAQL = [];
+      const claimsNUM = [];
       let claimCounter = 0;
-      const dataRows = lines.slice(1).map(l=>l.split(delim).map(c=>c.trim().replace(/"/g,'')));
       for (const r of dataRows){
-        if (r.length < headers.length) continue;
-        const cpt = r[iCPT].toUpperCase();
+        const cpt = String(r[iCPT] || '').trim();
         if (!cpt) continue;
-        
-        const date = normalizeDate(r[iDOS]);
-        const obj = {
-          provider: iProv > -1 ? r[iProv] : defaultProvider,
-          cpt,
-          dos: date ? date.toLocaleDateString() : r[iDOS],
-          dateSort: date ? date.getTime() : 0,
-          units: parseFloat(r[iUnits]) || 1,
-          charge: normalizeMoney(r[iCharge]),
-          paid: normalizeMoney(r[iPaid]),
-          isPaid: (normalizeMoney(r[iPaid]) || 0) > 0,
-          payer: r[iPayer] || null,
-          patient: r[iPatient] || null,
-          patient_id: r[iPatientID] || null,
-          claimNo: ++claimCounter,
-        };
-        const first = cpt.charAt(0);
-        if (first === 'A' || first === 'Q' || first === 'L'){ claimsAQL.push(obj); }
+        const units = parseFloat(r[iUnits]) || 0;
+        const charge = normalizeMoney(r[iCharges]);
+        const paid = Math.abs(normalizeMoney(r[iPaid]));
+        const patient = r[iPatient] || '';
+        const patient_id = r[iPatientID] || '';
+        const payer = iPayer !== -1 ? (r[iPayer] || '') : '';
+        const providerCellRaw = (iProvider!==-1 ? (r[iProvider]||'') : '').trim();
+        const provider = providerCellRaw || (document.getElementById('providerName').value.trim() || 'Unknown Provider');
+        const isPaid = paid > 0;
+        const dos = iDOS!==-1 ? (r[iDOS]||'') : '';
+        const d = parseDOS(dos);
+        const dateSort = d? d.getTime() : Infinity;
+        const leading = cpt[0] || '';
+        const codeType = /^[AQL]/i.test(cpt) ? leading.toUpperCase() : (/^[0-9]/.test(cpt) ? 'NUM' : leading.toUpperCase());
+        const obj = { claimNo: (++claimCounter), provider, cpt, codeType, units, charge, paid, patient, patient_id, payer, isPaid, dos, dateSort };
+        if (/^[AQL]/i.test(cpt)) claimsAQL.push(obj);
+        else if (/^[0-9]/.test(cpt)) claimsNUM.push(obj);
         else { claimsNUM.push(obj); }
       }
 
       if (!claimsAQL.length && !claimsNUM.length){ output.innerHTML = '<p>No claims detected.</p>'; return; }
 
-      allClaims = claimsAQL.concat(claimsNUM);
+      const allClaims = claimsAQL.concat(claimsNUM);
       const providers = Array.from(new Set(allClaims.map(c=>c.provider))).sort((a,b)=>a.localeCompare(b));
       const byProvUnits = new Map();
       allClaims.forEach(c=> byProvUnits.set(c.provider, (byProvUnits.get(c.provider)||0)+c.units));
       const top5 = providers.slice().sort((a,b)=> (byProvUnits.get(b)||0) - (byProvUnits.get(a)||0)).slice(0,5);
-      selectedProviders = new Set(top5);
+      const selectedProviders = new Set(top5);
 
       // ===== Report header =====
       const reportHeader = document.createElement('div');
       reportHeader.className = 'card';
       const pLabel = providers.length>1 ? `${providers.length} providers` : providers[0] || (document.getElementById('providerName').value.trim()||'Unknown Provider');
       reportHeader.innerHTML = `<div class="section-title"><h2>Report for ${pLabel}</h2><span class="muted">Generated: ${new Date().toLocaleString()}</span></div>
-     <div id="overallSummaryStats" class="row" style="gap:24px; margin-top:12px;">
-         <!-- Stats will be populated by a function -->
-     </div>
-     <div class="muted" style="margin-top:8px;">Includes A/Q/L and Numeric (0–9) CPT codes</div>`;
+      <div class="muted">Includes A/Q/L and Numeric (0–9) CPT codes</div>`;
+      const kpiWrap = document.createElement('div'); kpiWrap.className='kpis';
+      const kpi1 = document.createElement('div'); kpi1.className='kpi';
+      const kpi2 = document.createElement('div'); kpi2.className='kpi';
+      kpi1.innerHTML = `<h4>Total Collected</h4><div class="val" id="kpiCollected">$0.00</div>`;
+      kpi2.innerHTML = `<h4>Total Encounters</h4><div class="val" id="kpiEnc">0</div>`;
+      kpiWrap.appendChild(kpi1); kpiWrap.appendChild(kpi2); reportHeader.appendChild(kpiWrap);
       output.appendChild(reportHeader);
-      renderOverallSummaryStats();
+
+      function renderKPI(){
+        const considered = allClaims.filter(c=> selectedProviders.size? selectedProviders.has(c.provider): true);
+        const totalCollected = considered.reduce((s,x)=> s + x.paid, 0);
+        const eb = encBreakdown(considered);
+        document.getElementById('kpiCollected').textContent = fmtMoney(totalCollected);
+        document.getElementById('kpiEnc').textContent = eb.enc;
+      }
 
       // ===== Provider Comparison (A/Q/L) =====
-      const provCard = document.createElement('div'); provCard.className = 'card';
-      provCard.innerHTML = `<div class="section-title"><h3>Provider Comparison (A/Q/L codes)</h3>
-        <div class="muted">Showing top 5 by units by default. Select up to 5 providers.</div></div>`;
-      const provControls = document.createElement('div'); provControls.className = 'provider-list';
+      const aqlCard = document.createElement('div'); aqlCard.className='card';
+      aqlCard.innerHTML = `<div class="section-title"><h3>Provider Comparison (A/Q/L)</h3><span class="muted">Select up to 5 providers</span></div>`;
+      const provControls = document.createElement('div'); provControls.className='provider-list';
       providers.forEach(p=>{
         const lbl = document.createElement('label');
-        const cb = document.createElement('input'); cb.type='checkbox'; cb.value=p;
-        if (selectedProviders.has(p)) cb.checked = true;
+        const cb = document.createElement('input'); cb.type='checkbox'; cb.value=p; cb.checked = selectedProviders.has(p);
         cb.addEventListener('change', ()=>{
           const checked = Array.from(provControls.querySelectorAll('input[type=checkbox]:checked'));
           if (checked.length>5){ cb.checked=false; alert('Please select at most 5 providers.'); return; }
           selectedProviders.clear(); checked.forEach(x=> selectedProviders.add(x.value));
-         
-          renderOverallSummaryStats();
+          renderKPI();
           renderProviderComparisonAQL();
           rebuildAndRenderSummaryAQL();
-          renderProviderBreakdownsAQL();
           rebuildAndRenderSummaryNUM();
           renderProviderBreakdownsNUM();
-         
-          detailRenderFuncs.forEach(f => f());
+          renderClaimsNUMPaid();
+          renderClaimsNUMUnpaid();
+          renderClaimsAQLPaid();
+          renderClaimsAQLUnpaid();
         });
         lbl.appendChild(cb); lbl.appendChild(document.createTextNode(p)); provControls.appendChild(lbl);
       });
-      provCard.appendChild(provControls);
-      
-      const compTable = document.createElement('table');
-      const compHead = document.createElement('thead');
-      const compBody = document.createElement('tbody');
-      compTable.appendChild(compHead); compTable.appendChild(compBody); provCard.appendChild(compTable);
-      output.appendChild(provCard);
+      aqlCard.appendChild(provControls);
+
+      const provTable = document.createElement('table');
+      provTable.innerHTML = `<thead><tr>
+        <th>Provider</th>
+        <th>Total Units</th>
+        <th>Units Paid</th>
+        <th>Units Unpaid</th>
+        <th>Paid %</th>
+        <th>Total Paid ($)</th>
+        <th>Encounters</th>
+        <th>Paid Enc</th>
+        <th>Unpaid Enc</th>
+        <th>Paid Enc %</th>
+        <th>L Units</th>
+        <th>Q Units</th>
+        <th>A Units</th>
+      </tr></thead>`;
+      const provBody = document.createElement('tbody');
+      provTable.appendChild(provBody); aqlCard.appendChild(provTable); output.appendChild(aqlCard);
 
       function renderProviderComparisonAQL(){
-        compHead.innerHTML = ''; compBody.innerHTML = '';
-        if (!claimsAQL.length) return;
-        const selProvs = Array.from(selectedProviders);
-        const codes = Array.from(new Set(claimsAQL.map(c=>c.cpt))).sort((a,b)=>a.localeCompare(b));
-        let head = '<tr><th>CPT Code</th>'; selProvs.forEach(p=> head+=`<th>${p} (Paid %)</th>`); head+='</tr>'; compHead.innerHTML = head;
-        codes.forEach(code=>{
-          let row = `<tr><td>${code}</td>`;
-          selProvs.forEach(p=>{
-            const vals = claimsAQL.filter(c=> c.provider===p && c.cpt===code);
-            if (!vals.length) { row+='<td>–</td>'; return; }
-            const total = vals.reduce((s,x)=>s+x.units,0);
-            const paid = vals.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
-            const pct = total? Math.round(paid/total*100) : 0;
-            row+=`<td>${Math.round(total)} (${pct}%)</td>`;
-          });
-          row+='</tr>'; compBody.innerHTML += row;
+        provBody.innerHTML='';
+        const provs = selectedProviders.size? Array.from(selectedProviders) : providers;
+        provs.sort((a,b)=> (byProvUnits.get(b)||0) - (byProvUnits.get(a)||0));
+        provs.forEach(p=>{
+          const rows = claimsAQL.filter(c=>c.provider===p);
+          const totalUnits = rows.reduce((s,x)=>s+x.units,0);
+          const unitsPaid = rows.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
+          const unitsUnpaid = totalUnits - unitsPaid;
+          const paidPct = totalUnits? Math.round((unitsPaid/totalUnits)*100) : 0;
+          const totalPaidAmt = rows.reduce((s,x)=>s+x.paid,0);
+          const eb = encBreakdown(rows);
+          const L = rows.filter(r=>r.codeType==='L').reduce((s,x)=>s+x.units,0);
+          const Q = rows.filter(r=>r.codeType==='Q').reduce((s,x)=>s+x.units,0);
+          const A = rows.filter(r=>r.codeType==='A').reduce((s,x)=>s+x.units,0);
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${p}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${fmtMoney(totalPaidAmt)}</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>${Math.round(L)}</td><td>${Math.round(Q)}</td><td>${Math.round(A)}</td>`;
+          provBody.appendChild(tr);
         });
       }
+
+      // Kick initial renders
+      renderKPI();
       renderProviderComparisonAQL();
 
       // ===== High‑Level Summary by CPT Code (A/Q/L) =====
-      const summaryCard = document.createElement('div'); summaryCard.className = 'card';
-      summaryCard.innerHTML = `<div class="section-title"><h3>High-Level Summary (A/Q/L)</h3>
-        <div class="controls">
-          <label>CPT Code: <select id="codeSelect"><option value="">All</option></select></label>
-          <label>Paid Status: <select id="paidSelect">
-            <option value="">All</option><option value="paid">Paid</option><option value="unpaid">Unpaid</option>
-          </select></label>
-        </div></div>`;
-      
-      const codeSelect = summaryCard.querySelector('#codeSelect');
-      const paidSelect = summaryCard.querySelector('#paidSelect');
+      const summaryCard = document.createElement('div'); summaryCard.className='card'; summaryCard.innerHTML = `<h3>High‑Level Summary by CPT Code (A/Q/L)</h3>`;
+      const controls = document.createElement('div'); controls.className='controls';
+      const codeSelect = document.createElement('select'); codeSelect.id='codeFilterAQL';
+      const paidSelect = document.createElement('select'); paidSelect.id='paidFilterAQL';
+      paidSelect.innerHTML = `<option value="">All payment states</option><option value="paid">Paid only</option><option value="unpaid">Unpaid only</option>`;
+      controls.appendChild(document.createTextNode('Filter:')); controls.appendChild(codeSelect); controls.appendChild(paidSelect); summaryCard.appendChild(controls);
       const summaryTable = document.createElement('table');
+      summaryTable.innerHTML = '<thead><tr>'+
+        '<th style="width:12%">CPT Code</th>'+
+        '<th style="width:10%">Total Units</th>'+
+        '<th style="width:10%">Units Paid</th>'+
+        '<th style="width:10%">Units Unpaid</th>'+
+        '<th style="width:8%">Paid %</th>'+
+        '<th style="width:10%">Encounters</th>'+
+        '<th style="width:10%">Paid Enc</th>'+
+        '<th style="width:10%">Unpaid Enc</th>'+
+        '<th style="width:10%">Paid Enc %</th>'+
+        '<th style="width:10%">Total Paid ($)</th>'+
+      '</tr></thead>';
       const sbody = document.createElement('tbody');
       const sfoot = document.createElement('tfoot');
-      
-      const codeSetAQL = Array.from(new Set(claimsAQL.map(c=>c.cpt))).sort((a,b)=>a.localeCompare(b));
-      codeSelect.innerHTML = '<option value="">All</option>' + codeSetAQL.map(c=>`<option value="${c}">${c}</option>`).join('');
 
-      function rebuildAndRenderSummaryAQL() {
-        if (!claimsAQL.length) { summaryCard.style.display = 'none'; return; }
-        summaryCard.style.display = 'block';
-        sbody.innerHTML = ''; sfoot.innerHTML = '';
-        summaryTable.innerHTML = `<thead><tr>
-          <th style='width:20%'>Provider</th>
-          <th style='width:10%'>Total Units</th>
-          <th style='width:10%'>Units Paid</th>
-          <th style='width:10%'>Units Unpaid</th>
-          <th style='width:8%'>Paid %</th>
-          <th style='width:10%'>Encounters</th>
-          <th style='width:10%'>Paid Enc</th>
-          <th style='width:10%'>Unpaid Enc</th>
-          <th style='width:10%'>Paid Enc %</th>
-          <th style='width:12%'>Total Paid ($)</th>
-        </tr></thead>`;
-        summaryTable.appendChild(sbody); summaryTable.appendChild(sfoot);
-
-        const selCode = codeSelect.value;
-        const selPaid = paidSelect.value;
-        const base = claimsAQL.filter(c=> selectedProviders.size? selectedProviders.has(c.provider): true);
-        const byProv = new Map();
-        base.forEach(r=>{
-          if (selCode && r.cpt !== selCode) return;
-          if (selPaid==='paid' && !r.isPaid) return;
-          if (selPaid==='unpaid' && r.isPaid) return;
-          if (!byProv.has(r.provider)) byProv.set(r.provider, []);
-          byProv.get(r.provider).push(r);
-        });
-        const provs = Array.from(byProv.keys()).sort((a,b)=>a.localeCompare(b));
-        let TT=0, TP=0, TAmt=0; let TEnc=0, TEncPaid=0;
-        provs.forEach(p=>{
-          const vals = byProv.get(p);
+      function rebuildAndRenderSummaryAQL(){
+        const filteredClaims = claimsAQL.filter(c=> selectedProviders.size? selectedProviders.has(c.provider) : true);
+        const byCode = new Map(); filteredClaims.forEach(r=>{ if(!byCode.has(r.cpt)) byCode.set(r.cpt, []); byCode.get(r.cpt).push(r); });
+        const codes = Array.from(byCode.keys()).sort((a,b)=>a.localeCompare(b));
+        codeSelect.innerHTML = `<option value="">All CPT codes (${codes.length})</option>` + codes.map(c=>`<option value="${c}">${c}</option>`).join('');
+        const codeRows = codes.map(code=>{
+          const vals = byCode.get(code);
           const totalUnits = vals.reduce((s,x)=>s+x.units,0);
           const unitsPaid = vals.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
           const unitsUnpaid = totalUnits - unitsPaid;
-          const paidPct = totalUnits? Math.round(unitsPaid/totalUnits*100) : 0;
           const eb = encBreakdown(vals);
           const totalPaid = vals.reduce((s,x)=>s+x.paid,0);
-          sbody.innerHTML += `<tr><td>${p}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>$${totalPaid.toFixed(2)}</td></tr>`;
-          TT+=totalUnits; TP+=unitsPaid; TAmt+=totalPaid; TEnc+=eb.enc; TEncPaid+=eb.paid;
+          return { code, totalUnits, unitsPaid, unitsUnpaid, encounters: eb.enc, paidEnc: eb.paid, unpaidEnc: eb.unpaid, paidEncPct: eb.pct, totalPaid };
         });
-        const TUnpaid = TT-TP; const TPct = TT? Math.round(TP/TT*100):0; const TEncUnpaid = TEnc - TEncPaid; const TEncPct = TEnc? Math.round(TEncPaid/TEnc*100):0;
-        sfoot.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(TT)}</strong></td><td><strong>${Math.round(TP)}</strong></td><td><strong>${Math.round(TUnpaid)}</strong></td><td><strong>${TPct}%</strong></td><td><strong>${TEnc}</strong></td><td><strong>${TEncPaid}</strong></td><td><strong>${TEncUnpaid}</strong></td><td><strong>${TEncPct}%</strong></td><td><strong>$${TAmt.toFixed(2)}</strong></td></tr>`;
+        sbody.innerHTML='';
+        const selCode = codeSelect.value; const selPaid = paidSelect.value;
+        let T_total=0, T_paid=0, T_amt=0;
+        codeRows.forEach(r=>{
+          if (selCode && r.code !== selCode) return;
+          if (selPaid==='paid' && r.unitsPaid===0) return;
+          if (selPaid==='unpaid' && r.unitsUnpaid===0) return;
+          const paidPct = r.totalUnits ? Math.round((r.unitsPaid/r.totalUnits)*100) : 0;
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${r.code}</td>
+            <td>${Math.round(r.totalUnits)}</td>
+            <td>${Math.round(r.unitsPaid)}</td>
+            <td>${Math.round(r.unitsUnpaid)}</td>
+            <td>${paidPct}%</td>
+            <td>${r.encounters}</td>
+            <td>${r.paidEnc}</td>
+            <td>${r.unpaidEnc}</td>
+            <td>${r.paidEncPct}%</td>
+            <td>${fmtMoney(r.totalPaid)}</td>`;
+          sbody.appendChild(tr);
+          T_total += r.totalUnits; T_paid += r.unitsPaid; T_amt += r.totalPaid;
+        });
+        const T_unpaid = T_total - T_paid; const T_pct = T_total ? Math.round((T_paid/T_total)*100) : 0;
+        const ebAll = encBreakdown(filteredClaims);
+        sfoot.innerHTML = `<tr>
+          <td><strong>Total</strong></td>
+          <td><strong>${Math.round(T_total)}</strong></td>
+          <td><strong>${Math.round(T_paid)}</strong></td>
+          <td><strong>${Math.round(T_unpaid)}</strong></td>
+          <td><strong>${T_pct}%</strong></td>
+          <td><strong>${ebAll.enc}</strong></td>
+          <td><strong>${ebAll.paid}</strong></td>
+          <td><strong>${ebAll.unpaid}</strong></td>
+          <td><strong>${ebAll.pct}%</strong></td>
+          <td><strong>${fmtMoney(T_amt)}</strong></td>
+        </tr>`;
       }
       rebuildAndRenderSummaryAQL();
       codeSelect.addEventListener('change', rebuildAndRenderSummaryAQL);
       paidSelect.addEventListener('change', rebuildAndRenderSummaryAQL);
       summaryTable.appendChild(sbody); summaryTable.appendChild(sfoot); summaryCard.appendChild(summaryTable); output.appendChild(summaryCard);
 
-       // ===== Per-Provider CPT Breakdown (A/Q/L) =====
-     const providerBreakdownAQLContainer = document.createElement('div');
-     output.appendChild(providerBreakdownAQLContainer);
-     function renderProviderBreakdownsAQL() {
-         providerBreakdownAQLContainer.innerHTML = '';
-         if (!claimsAQL.length) return;
-         const selectedProvsA = Array.from(selectedProviders.size? selectedProviders : providers);
-         selectedProvsA.forEach(p => {
-           const pCard = document.createElement('div'); pCard.className = 'card'; pCard.innerHTML = `<h3>Provider Breakdown — ${p} (A/Q/L)</h3>`;
-           const rowsP = claimsAQL.filter(c=>c.provider===p);
-           const byCodeP = new Map(); rowsP.forEach(r=>{ if(!byCodeP.has(r.cpt)) byCodeP.set(r.cpt, []); byCodeP.get(r.cpt).push(r); });
-           const codesP = Array.from(byCodeP.keys()).sort((a,b)=>a.localeCompare(b));
-           const tblP = document.createElement('table');
-           tblP.innerHTML = `<thead><tr>
-             <th style='width:12%'>CPT Code</th>
-             <th style='width:10%'>Total Units</th>
-             <th style='width:10%'>Units Paid</th>
-             <th style='width:10%'>Units Unpaid</th>
-             <th style='width:8%'>Paid %</th>
-             <th style='width:10%'>Encounters</th>
-             <th style='width:10%'>Paid Enc</th>
-             <th style='width:10%'>Unpaid Enc</th>
-             <th style='width:10%'>Paid Enc %</th>
-             <th style='width:10%'>Total Paid ($)</th>
-           </tr></thead>`;
-           const tbP = document.createElement('tbody');
-           let TT=0, TP=0, TAmt=0; let TEnc=0, TEncPaid=0;
-           codesP.forEach(code=>{
-             const vals = byCodeP.get(code);
-             const totalUnits = vals.reduce((s,x)=>s+x.units,0);
-             const unitsPaid = vals.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
-             const unitsUnpaid = totalUnits - unitsPaid;
-             const paidPct = totalUnits? Math.round(unitsPaid/totalUnits*100) : 0;
-             const eb = encBreakdown(vals);
-             const totalPaid = vals.reduce((s,x)=>s+x.paid,0);
-             const rowEl = document.createElement('tr'); rowEl.innerHTML = `<td>${code}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>$${totalPaid.toFixed(2)}</td>`;
-             tbP.appendChild(rowEl);
-             TT+=totalUnits; TP+=unitsPaid; TAmt+=totalPaid; TEnc+=eb.enc; TEncPaid+=eb.paid;
-           });
-           const TUnpaid = TT-TP; const TPct = TT? Math.round(TP/TT*100):0; const TEncUnpaid = TEnc - TEncPaid; const TEncPct = TEnc? Math.round(TEncPaid/TEnc*100):0;
-           const tfoot = document.createElement('tfoot'); tfoot.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(TT)}</strong></td><td><strong>${Math.round(TP)}</strong></td><td><strong>${Math.round(TUnpaid)}</strong></td><td><strong>${TPct}%</strong></td><td><strong>${TEnc}</strong></td><td><strong>${TEncPaid}</strong></td><td><strong>${TEncUnpaid}</strong></td><td><strong>${TEncPct}%</strong></td><td><strong>$${TAmt.toFixed(2)}</strong></td></tr>`;
-           tblP.appendChild(tbP); tblP.appendChild(tfoot); pCard.appendChild(tblP); 
-           providerBreakdownAQLContainer.appendChild(pCard);
-         });
-     }
-     renderProviderBreakdownsAQL();
+      // ===== Per-Provider CPT Breakdown (A/Q/L) =====
+      if (claimsAQL.length){
+        const selectedProvsA = Array.from(selectedProviders.size? selectedProviders : providers);
+        selectedProvsA.forEach(p => {
+          const pCard = document.createElement('div'); pCard.className = 'card'; pCard.innerHTML = `<h3>Provider Breakdown — ${p} (A/Q/L)</h3>`;
+          const rowsP = claimsAQL.filter(c=>c.provider===p);
+          const byCodeP = new Map(); rowsP.forEach(r=>{ if(!byCodeP.has(r.cpt)) byCodeP.set(r.cpt, []); byCodeP.get(r.cpt).push(r); });
+          const codesP = Array.from(byCodeP.keys()).sort((a,b)=>a.localeCompare(b));
+          const tblP = document.createElement('table');
+          tblP.innerHTML = `<thead><tr>
+            <th style='width:12%'>CPT Code</th>
+            <th style='width:10%'>Total Units</th>
+            <th style='width:10%'>Units Paid</th>
+            <th style='width:10%'>Units Unpaid</th>
+            <th style='width:8%'>Paid %</th>
+            <th style='width:10%'>Encounters</th>
+            <th style='width:10%'>Paid Enc</th>
+            <th style='width:10%'>Unpaid Enc</th>
+            <th style='width:10%'>Paid Enc %</th>
+            <th style='width:10%'>Total Paid ($)</th>
+          </tr></thead>`;
+          const tbP = document.createElement('tbody');
+          let TT=0, TP=0, TAmt=0; let TEnc=0, TEncPaid=0;
+          codesP.forEach(code=>{
+            const vals = byCodeP.get(code);
+            const totalUnits = vals.reduce((s,x)=>s+x.units,0);
+            const unitsPaid = vals.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
+            const unitsUnpaid = totalUnits - unitsPaid;
+            const paidPct = totalUnits? Math.round(unitsPaid/totalUnits*100) : 0;
+            const eb = encBreakdown(vals);
+            const totalPaid = vals.reduce((s,x)=>s+x.paid,0);
+            const rowEl = document.createElement('tr'); rowEl.innerHTML = `<td>${code}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>${fmtMoney(totalPaid)}</td>`;
+            tbP.appendChild(rowEl);
+            TT+=totalUnits; TP+=unitsPaid; TAmt+=totalPaid; TEnc+=eb.enc; TEncPaid+=eb.paid;
+          });
+          const TUnpaid = TT-TP; const TPct = TT? Math.round(TP/TT*100):0; const TEncUnpaid = TEnc - TEncPaid; const TEncPct = TEnc? Math.round(TEncPaid/TEnc*100):0;
+          const tfoot = document.createElement('tfoot'); tfoot.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(TT)}</strong></td><td><strong>${Math.round(TP)}</strong></td><td><strong>${Math.round(TUnpaid)}</strong></td><td><strong>${TPct}%</strong></td><td><strong>${TEnc}</strong></td><td><strong>${TEncPaid}</strong></td><td><strong>${TEncUnpaid}</strong></td><td><strong>${TEncPct}%</strong></td><td><strong>${fmtMoney(TAmt)}</strong></td></tr>`;
+          tblP.appendChild(tbP); tblP.appendChild(tfoot); pCard.appendChild(tblP); output.appendChild(pCard);
+        });
+      }
 
       // ===== High‑Level Summary by CPT Code (0–9) =====
-      const summaryNum = document.createElement('div'); summaryNum.className = 'card';
-      summaryNum.innerHTML = `<div class="section-title"><h3>High-Level Summary (0–9)</h3>
-        <div class="controls">
-          <label>CPT Code: <select id="codeSelectN"><option value="">All</option></select></label>
-          <label>Paid Status: <select id="paidSelectN">
-            <option value="">All</option><option value="paid">Paid</option><option value="unpaid">Unpaid</option>
-          </select></label>
-        </div></div>`;
-      
-      const codeSelectN = summaryNum.querySelector('#codeSelectN');
-      const paidSelectN = summaryNum.querySelector('#paidSelectN');
-      const tableN = document.createElement('table');
-      const tbodyN = document.createElement('tbody');
-      const tfootN = document.createElement('tfoot');
-      
-      const codeSetNUM = Array.from(new Set(claimsNUM.map(c=>c.cpt))).sort((a,b)=>a.localeCompare(b));
-      codeSelectN.innerHTML = '<option value="">All</option>' + codeSetNUM.map(c=>`<option value="${c}">${c}</option>`).join('');
-
-      function rebuildAndRenderSummaryNUM() {
-        if (!claimsNUM.length) { summaryNum.style.display = 'none'; return; }
-        summaryNum.style.display = 'block';
-        tbodyN.innerHTML = ''; tfootN.innerHTML = '';
+      if (claimsNUM.length){
+        const summaryNum = document.createElement('div'); summaryNum.className='card'; summaryNum.innerHTML = `<h3>High‑Level Summary by CPT Code (0–9)</h3>`;
+        const controlsN = document.createElement('div'); controlsN.className='controls';
+        const codeSelectN = document.createElement('select'); codeSelectN.id='codeFilterNUM';
+        const paidSelectN = document.createElement('select'); paidSelectN.id='paidFilterNUM'; paidSelectN.innerHTML = `<option value="">All payment states</option><option value="paid">Paid only</option><option value="unpaid">Unpaid only</option>`;
+        controlsN.appendChild(document.createTextNode('Filter:')); controlsN.appendChild(codeSelectN); controlsN.appendChild(paidSelectN); summaryNum.appendChild(controlsN);
+        const tableN = document.createElement('table');
         tableN.innerHTML = `<thead><tr>
-          <th style='width:20%'>Provider</th>
+          <th style='width:12%'>CPT Code</th>
           <th style='width:10%'>Total Units</th>
           <th style='width:10%'>Units Paid</th>
           <th style='width:10%'>Units Unpaid</th>
@@ -495,53 +437,51 @@
           <th style='width:10%'>Paid Enc</th>
           <th style='width:10%'>Unpaid Enc</th>
           <th style='width:10%'>Paid Enc %</th>
-          <th style='width:12%'>Total Paid ($)</th>
+          <th style='width:10%'>Total Paid ($)</th>
         </tr></thead>`;
-        tableN.appendChild(tbodyN); tableN.appendChild(tfootN);
-
-        const selCode = codeSelectN.value;
-        const selPaid = paidSelectN.value;
-        const base = claimsNUM.filter(c=> selectedProviders.size? selectedProviders.has(c.provider): true);
-        const byProv = new Map();
-        base.forEach(r=>{
-          if (selCode && r.cpt !== selCode) return;
-          if (selPaid==='paid' && !r.isPaid) return;
-          if (selPaid==='unpaid' && r.isPaid) return;
-          if (!byProv.has(r.provider)) byProv.set(r.provider, []);
-          byProv.get(r.provider).push(r);
-        });
-        const provs = Array.from(byProv.keys()).sort((a,b)=>a.localeCompare(b));
-        let TT=0, TP=0, TAmt=0; let TEnc=0, TEncPaid=0;
-        provs.forEach(p=>{
-          const vals = byProv.get(p);
-          const totalUnits = vals.reduce((s,x)=>s+x.units,0);
-          const unitsPaid = vals.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
-          const unitsUnpaid = totalUnits - unitsPaid;
-          const paidPct = totalUnits? Math.round(unitsPaid/totalUnits*100) : 0;
-          const eb = encBreakdown(vals);
-          const totalPaid = vals.reduce((s,x)=>s+x.paid,0);
-          tbodyN.innerHTML += `<tr><td>${p}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>$${totalPaid.toFixed(2)}</td></tr>`;
-          TT+=totalUnits; TP+=unitsPaid; TAmt+=totalPaid; TEnc+=eb.enc; TEncPaid+=eb.paid;
-        });
-        const TUnpaid = TT-TP; const TPct = TT? Math.round(TP/TT*100):0; const TEncUnpaid = TEnc - TEncPaid; const TEncPct = TEnc? Math.round(TEncPaid/TEnc*100):0;
-        tfootN.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(TT)}</strong></td><td><strong>${Math.round(TP)}</strong></td><td><strong>${Math.round(TUnpaid)}</strong></td><td><strong>${TPct}%</strong></td><td><strong>${TEnc}</strong></td><td><strong>${TEncPaid}</strong></td><td><strong>${TEncUnpaid}</strong></td><td><strong>${TEncPct}%</strong></td><td><strong>$${TAmt.toFixed(2)}</strong></td></tr>`;
-      }
-      if (claimsNUM.length) {
+        const tbodyN = document.createElement('tbody');
+        const tfootN = document.createElement('tfoot');
+        function rebuildAndRenderSummaryNUM(){
+          const filtered = claimsNUM.filter(c=> selectedProviders.size? selectedProviders.has(c.provider) : true);
+          const byCode = new Map(); filtered.forEach(r=>{ if(!byCode.has(r.cpt)) byCode.set(r.cpt, []); byCode.get(r.cpt).push(r); });
+          const codes = Array.from(byCode.keys()).sort((a,b)=>a.localeCompare(b));
+          codeSelectN.innerHTML = `<option value="">All CPT codes (${codes.length})</option>` + codes.map(c=>`<option value='${c}'>${c}</option>`).join('');
+          const rowsN = codes.map(code=>{
+            const vals = byCode.get(code);
+            const totalUnits = vals.reduce((s,x)=>s+x.units,0);
+            const unitsPaid = vals.filter(x=>x.isPaid).reduce((s,x)=>s+x.units,0);
+            const unitsUnpaid = totalUnits - unitsPaid;
+            const eb = encBreakdown(vals);
+            const totalPaid = vals.reduce((s,x)=>s+x.paid,0);
+            return { code, totalUnits, unitsPaid, unitsUnpaid, encounters: eb.enc, paidEnc: eb.paid, unpaidEnc: eb.unpaid, paidEncPct: eb.pct, totalPaid };
+          });
+          tbodyN.innerHTML='';
+          const selCode = codeSelectN.value; const selPaid = paidSelectN.value;
+          let T_total=0, T_paid=0, T_amt=0;
+          rowsN.forEach(r=>{
+            if (selCode && r.code !== selCode) return;
+            if (selPaid==='paid' && r.unitsPaid===0) return;
+            if (selPaid==='unpaid' && r.unitsUnpaid===0) return;
+            const paidPct = r.totalUnits? Math.round(r.unitsPaid/r.totalUnits*100):0;
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${r.code}</td><td>${Math.round(r.totalUnits)}</td><td>${Math.round(r.unitsPaid)}</td><td>${Math.round(r.unitsUnpaid)}</td><td>${paidPct}%</td><td>${r.encounters}</td><td>${r.paidEnc}</td><td>${r.unpaidEnc}</td><td>${r.paidEncPct}%</td><td>${fmtMoney(r.totalPaid)}</td>`;
+            tbodyN.appendChild(tr);
+            T_total+=r.totalUnits; T_paid+=r.unitsPaid; T_amt+=r.totalPaid;
+          });
+          const T_unpaid = T_total - T_paid; const T_pct = T_total? Math.round(T_paid/T_total*100):0;
+          const ebAll = encBreakdown(filtered);
+          tfootN.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(T_total)}</strong></td><td><strong>${Math.round(T_paid)}</strong></td><td><strong>${Math.round(T_unpaid)}</strong></td><td><strong>${T_pct}%</strong></td><td><strong>${ebAll.enc}</strong></td><td><strong>${ebAll.paid}</strong></td><td><strong>${ebAll.unpaid}</strong></td><td><strong>${ebAll.pct}%</strong></td><td><strong>${fmtMoney(T_amt)}</strong></td></tr>`;
+        }
         rebuildAndRenderSummaryNUM();
         codeSelectN.addEventListener('change', rebuildAndRenderSummaryNUM);
         paidSelectN.addEventListener('change', rebuildAndRenderSummaryNUM);
         tableN.appendChild(tbodyN); tableN.appendChild(tfootN); summaryNum.appendChild(tableN); output.appendChild(summaryNum);
 
-        const providerBreakdownNumContainer = document.createElement('div');
-        output.appendChild(providerBreakdownNumContainer);
-  
         // Per-Provider Numeric Breakdown
         function renderProviderBreakdownsNUM(){
-          providerBreakdownNumContainer.innerHTML = '';
-          if (!claimsNUM.length) return;
           const selectedProvsN = Array.from(selectedProviders.size? selectedProviders : providers);
           selectedProvsN.forEach(p => {
-            const pCard = document.createElement('div'); pCard.className = 'card'; pCard.innerHTML = `<h3>Provider Breakdown — ${p} (0–9)</h3>`;
+            const pCard = document.createElement('div'); pCard.className='card'; pCard.innerHTML = `<h3>Provider Breakdown — ${p} (0–9)</h3>`;
             const rowsP = claimsNUM.filter(c=>c.provider===p);
             const byCodeP = new Map(); rowsP.forEach(r=>{ if(!byCodeP.has(r.cpt)) byCodeP.set(r.cpt, []); byCodeP.get(r.cpt).push(r); });
             const codesP = Array.from(byCodeP.keys()).sort((a,b)=>a.localeCompare(b));
@@ -568,45 +508,122 @@
               const paidPct = totalUnits? Math.round(unitsPaid/totalUnits*100) : 0;
               const eb = encBreakdown(vals);
               const totalPaid = vals.reduce((s,x)=>s+x.paid,0);
-              const rowEl = document.createElement('tr'); rowEl.innerHTML = `<td>${code}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>$${totalPaid.toFixed(2)}</td>`;
+              const rowEl = document.createElement('tr'); rowEl.innerHTML = `<td>${code}</td><td>${Math.round(totalUnits)}</td><td>${Math.round(unitsPaid)}</td><td>${Math.round(unitsUnpaid)}</td><td>${paidPct}%</td><td>${eb.enc}</td><td>${eb.paid}</td><td>${eb.unpaid}</td><td>${eb.pct}%</td><td>${fmtMoney(totalPaid)}</td>`;
               tbP.appendChild(rowEl);
               TT+=totalUnits; TP+=unitsPaid; TAmt+=totalPaid; TEnc+=eb.enc; TEncPaid+=eb.paid;
             });
             const TUnpaid = TT-TP; const TPct = TT? Math.round(TP/TT*100):0; const TEncUnpaid = TEnc - TEncPaid; const TEncPct = TEnc? Math.round(TEncPaid/TEnc*100):0;
-            const tfoot = document.createElement('tfoot'); tfoot.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(TT)}</strong></td><td><strong>${Math.round(TP)}</strong></td><td><strong>${Math.round(TUnpaid)}</strong></td><td><strong>${TPct}%</strong></td><td><strong>${TEnc}</strong></td><td><strong>${TEncPaid}</strong></td><td><strong>${TEncUnpaid}</strong></td><td><strong>${TEncPct}%</strong></td><td><strong>$${TAmt.toFixed(2)}</strong></td></tr>`;
-            tblP.appendChild(tbP); tblP.appendChild(tfoot); pCard.appendChild(tblP); 
-            providerBreakdownNumContainer.appendChild(pCard);
+            const tfoot = document.createElement('tfoot'); tfoot.innerHTML = `<tr><td><strong>Total</strong></td><td><strong>${Math.round(TT)}</strong></td><td><strong>${Math.round(TP)}</strong></td><td><strong>${Math.round(TUnpaid)}</strong></td><td><strong>${TPct}%</strong></td><td><strong>${TEnc}</strong></td><td><strong>${TEncPaid}</strong></td><td><strong>${TEncUnpaid}</strong></td><td><strong>${TEncPct}%</strong></td><td><strong>${fmtMoney(TAmt)}</strong></td></tr>`;
+            tblP.appendChild(tbP); tblP.appendChild(tfoot); pCard.appendChild(tblP); output.appendChild(pCard);
           });
         }
         renderProviderBreakdownsNUM();
+
+        // ===== All Individual Claims (0–9): Unpaid / Paid separate =====
+        function createClaimsSection(title, claims, isPaidWanted){
+          const card = document.createElement('div'); card.className='card';
+          card.innerHTML = `<div class="section-title"><h3>${title}</h3>
+            <div class="pill-legend"><span class="pill ${isPaidWanted?'pill-paid':'pill-unpaid'}">${isPaidWanted?'PAID':'UNPAID'}</span></div>
+            <div class="controls">
+              <label>Provider: <select class="prov"><option value="">All</option></select></label>
+              <label>CPT: <select class="cpt"><option value="">All</option></select></label>
+              <label>DOS from: <input type="date" class="from"></label>
+              <label>to: <input type="date" class="to"></label>
+            </div>
+          </div>`;
+          const tbl = document.createElement('table');
+          tbl.innerHTML = '<thead><tr><th style="width:6%">#</th><th style="width:16%">Provider</th><th style="width:20%">Payer</th><th style="width:10%">Patient ID</th><th style="width:10%">CPT</th><th style="width:8%">Units</th><th style="width:12%">DOS</th><th style="width:12%">Charge ($)</th><th style="width:12%">Paid ($)</th></tr></thead>';
+          const tb = document.createElement('tbody');
+          const provSel = card.querySelector('.prov');
+          const cptSel = card.querySelector('.cpt');
+          const fromEl = card.querySelector('.from');
+          const toEl = card.querySelector('.to');
+          provSel.innerHTML = '<option value="">All</option>' + providers.map(p=>`<option value="${p}">${p}</option>`).join('');
+          const codeSet = Array.from(new Set(claims.map(c=>c.cpt))).sort((a,b)=>a.localeCompare(b));
+          cptSel.innerHTML = '<option value="">All</option>' + codeSet.map(c=>`<option value="${c}">${c}</option>`).join('');
+          function render(){
+            tb.innerHTML='';
+            const selProv = provSel.value; const selCode = cptSel.value;
+            const fromVal = fromEl.value ? new Date(fromEl.value).getTime() : -Infinity;
+            const toVal = toEl.value ? new Date(toEl.value).getTime() : Infinity;
+            const base = claims.filter(c=> (selectedProviders.size? selectedProviders.has(c.provider): true) && c.isPaid===isPaidWanted);
+            base.forEach(r=>{
+              if (selProv && r.provider !== selProv) return;
+              if (selCode && r.cpt !== selCode) return;
+              const t = r.dateSort; if (!(t>=fromVal && t<=toVal)) return;
+              tb.innerHTML += `<tr><td>${r.claimNo}</td><td>${r.provider}</td><td>${r.payer||''}</td><td>${r.patient_id}</td><td>${r.cpt}</td><td>${Math.round(r.units)}</td><td>${r.dos||''}</td><td>${fmtMoney(r.charge)}</td><td>${fmtMoney(r.paid)}</td></tr>`;
+            });
+          }
+          render();
+          provSel.addEventListener('change', render);
+          cptSel.addEventListener('change', render);
+          fromEl.addEventListener('change', render);
+          toEl.addEventListener('change', render);
+          tbl.appendChild(tb); card.appendChild(tbl); output.appendChild(card);
+          return { render }
+        }
+
+        const numUnpaid = createClaimsSection('All Individual Claims (0–9) — Unpaid', claimsNUM, false);
+        const numPaid = createClaimsSection('All Individual Claims (0–9) — Paid', claimsNUM, true);
+        function renderClaimsNUMUnpaid(){ numUnpaid.render(); }
+        function renderClaimsNUMPaid(){ numPaid.render(); }
+        // initial
+        renderClaimsNUMUnpaid(); renderClaimsNUMPaid();
       }
 
-      // ===== Individual Claim Details =====
-      if (claimsNUM.length) {
-          const unpaidNum = createClaimsDetailTable('Unpaid Individual Claims (0-9)', claimsNUM, 'unpaid');
-          output.appendChild(unpaidNum.card);
-          unpaidNum.render(); // Initial render
-          detailRenderFuncs.push(unpaidNum.render);
+      // ===== All Individual Claims (A/Q/L): Unpaid / Paid separate =====
+      if (claimsAQL.length){
+        function createClaimsSectionAQL(title, claims, isPaidWanted){
+          const card = document.createElement('div'); card.className='card';
+          card.innerHTML = `<div class="section-title"><h3>${title}</h3>
+            <div class="pill-legend"><span class="pill ${isPaidWanted?'pill-paid':'pill-unpaid'}">${isPaidWanted?'PAID':'UNPAID'}</span></div>
+            <div class="controls">
+              <label>Provider: <select class="prov"><option value="">All</option></select></label>
+              <label>CPT: <select class="cpt"><option value="">All</option></select></label>
+              <label>DOS from: <input type="date" class="from"></label>
+              <label>to: <input type="date" class="to"></label>
+            </div>
+          </div>`;
+          const tbl = document.createElement('table');
+          tbl.innerHTML = '<thead><tr><th style="width:6%">#</th><th style="width:16%">Provider</th><th style="width:20%">Payer</th><th style="width:10%">Patient ID</th><th style="width:10%">CPT</th><th style="width:8%">Units</th><th style="width:12%">DOS</th><th style="width:12%">Charge ($)</th><th style="width:12%">Paid ($)</th></tr></thead>';
+          const tb = document.createElement('tbody');
+          const provSel = card.querySelector('.prov');
+          const cptSel = card.querySelector('.cpt');
+          const fromEl = card.querySelector('.from');
+          const toEl = card.querySelector('.to');
+          provSel.innerHTML = '<option value="">All</option>' + providers.map(p=>`<option value="${p}">${p}</option>`).join('');
+          const codeSet = Array.from(new Set(claims.map(c=>c.cpt))).sort((a,b)=>a.localeCompare(b));
+          cptSel.innerHTML = '<option value="">All</option>' + codeSet.map(c=>`<option value="${c}">${c}</option>`).join('');
+          function render(){
+            tb.innerHTML='';
+            const selProv = provSel.value; const selCode = cptSel.value;
+            const fromVal = fromEl.value ? new Date(fromEl.value).getTime() : -Infinity;
+            const toVal = toEl.value ? new Date(toEl.value).getTime() : Infinity;
+            const base = claims.filter(c=> (selectedProviders.size? selectedProviders.has(c.provider): true) && c.isPaid===isPaidWanted);
+            base.forEach(r=>{
+              if (selProv && r.provider !== selProv) return;
+              if (selCode && r.cpt !== selCode) return;
+              const t = r.dateSort; if (!(t>=fromVal && t<=toVal)) return;
+              tb.innerHTML += `<tr><td>${r.claimNo}</td><td>${r.provider}</td><td>${r.payer||''}</td><td>${r.patient_id}</td><td>${r.cpt}</td><td>${Math.round(r.units)}</td><td>${r.dos||''}</td><td>${fmtMoney(r.charge)}</td><td>${fmtMoney(r.paid)}</td></tr>`;
+            });
+          }
+          render();
+          provSel.addEventListener('change', render);
+          cptSel.addEventListener('change', render);
+          fromEl.addEventListener('change', render);
+          toEl.addEventListener('change', render);
+          tbl.appendChild(tb); card.appendChild(tbl); output.appendChild(card);
+          return { render }
+        }
 
-          const paidNum = createClaimsDetailTable('Paid Individual Claims (0-9)', claimsNUM, 'paid');
-          output.appendChild(paidNum.card);
-          paidNum.render(); // Initial render
-          detailRenderFuncs.push(paidNum.render);
-      }
-
-      if (claimsAQL.length) {
-          const unpaidAQL = createClaimsDetailTable('Unpaid Individual Claims (A/Q/L)', claimsAQL, 'unpaid');
-          output.appendChild(unpaidAQL.card);
-          unpaidAQL.render(); // Initial render
-          detailRenderFuncs.push(unpaidAQL.render);
-
-          const paidAQL = createClaimsDetailTable('Paid Individual Claims (A/Q/L)', claimsAQL, 'paid');
-          output.appendChild(paidAQL.card);
-          paidAQL.render(); // Initial render
-          detailRenderFuncs.push(paidAQL.render);
+        const aqlUnpaid = createClaimsSectionAQL('All Individual Claims (A/Q/L) — Unpaid', claimsAQL, false);
+        const aqlPaid = createClaimsSectionAQL('All Individual Claims (A/Q/L) — Paid', claimsAQL, true);
+        function renderClaimsAQLUnpaid(){ aqlUnpaid.render(); }
+        function renderClaimsAQLPaid(){ aqlPaid.render(); }
+        // initial
+        renderClaimsAQLUnpaid(); renderClaimsAQLPaid();
       }
     }
   </script>
 </body>
 </html>
-
