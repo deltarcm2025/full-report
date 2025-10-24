@@ -245,9 +245,7 @@
           rebuildAndRenderSummaryAQL();
           rebuildAndRenderSummaryNUM();
           renderProviderBreakdownsNUM();
-          renderClaimsNUMPaid();
           renderClaimsNUMUnpaid();
-          renderClaimsAQLPaid();
           renderClaimsAQLUnpaid();
         });
         lbl.appendChild(cb); lbl.appendChild(document.createTextNode(p)); provControls.appendChild(lbl);
@@ -564,11 +562,9 @@
         }
 
         const numUnpaid = createClaimsSection('All Individual Claims (0–9) — Unpaid', claimsNUM, false);
-        const numPaid = createClaimsSection('All Individual Claims (0–9) — Paid', claimsNUM, true);
         function renderClaimsNUMUnpaid(){ numUnpaid.render(); }
-        function renderClaimsNUMPaid(){ numPaid.render(); }
         // initial
-        renderClaimsNUMUnpaid(); renderClaimsNUMPaid();
+        renderClaimsNUMUnpaid();
       }
 
       // ===== All Individual Claims (A/Q/L): Unpaid / Paid separate =====
@@ -617,11 +613,9 @@
         }
 
         const aqlUnpaid = createClaimsSectionAQL('All Individual Claims (A/Q/L) — Unpaid', claimsAQL, false);
-        const aqlPaid = createClaimsSectionAQL('All Individual Claims (A/Q/L) — Paid', claimsAQL, true);
         function renderClaimsAQLUnpaid(){ aqlUnpaid.render(); }
-        function renderClaimsAQLPaid(){ aqlPaid.render(); }
         // initial
-        renderClaimsAQLUnpaid(); renderClaimsAQLPaid();
+        renderClaimsAQLUnpaid();
       }
     }
   </script>
